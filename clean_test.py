@@ -2,9 +2,9 @@ from pathlib import Path
 from pyspark.sql import SparkSession, functions as F
 
 base_dir = Path(__file__).resolve().parent
-test_path = str(base_dir / "raw data" / "test.csv")
-output_dir = base_dir / "output"
-output_dir.mkdir(exist_ok=True)
+test_path = str(base_dir / "data" / "raw" / "test.csv")
+output_dir = base_dir / "data" / "processed"
+output_dir.mkdir(parents=True, exist_ok=True)
 
 spark = (
     SparkSession.builder

@@ -1,0 +1,13 @@
+[project]
+name = "taxi-fare-prediction"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "joblib>=1.5.3",
+    "matplotlib>=3.8.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "pyarrow>=24.0.0",
+    "pyspark>=3.5.0",
+    "scikit-learn>=1.8.0",
+]
