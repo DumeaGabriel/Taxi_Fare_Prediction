@@ -1,197 +1,418 @@
+"""evaluate.py — model evaluation with charts and test-set metrics."""
+from __future__ import annotations
+
 from pathlib import Path
+
 import joblib
-import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
+import pandas as pd
 from sklearn.metrics import (
     mean_absolute_error,
+    mean_absolute_percentage_error,
     mean_squared_error,
     r2_score,
-    mean_absolute_percentage_error
 )
 from sklearn.model_selection import train_test_split
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def calculate_accuracy_metrics(y_true, y_pred):
-    """Calculate comprehensive accuracy metrics for regression."""
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
+    return R * 2 * np.arcsin(np.sqrt(a))
 
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "pickup_datetime" in df.columns:
+        ts = pd.to_datetime(df["pickup_datetime"], errors="coerce")
+        if "pickup_year" not in df.columns:
+            df["pickup_year"] = ts.dt.year
+        if "pickup_month" not in df.columns:
+            df["pickup_month"] = ts.dt.month
+        if "pickup_day" not in df.columns:
+            df["pickup_day"] = ts.dt.day
+        if "pickup_hour" not in df.columns:
+            df["pickup_hour"] = ts.dt.hour
+        df = df.drop(columns=["pickup_datetime"])
+    coord_cols = {"pickup_latitude", "pickup_longitude", "dropoff_latitude", "dropoff_longitude"}
+    if coord_cols.issubset(df.columns):
+        df["haversine_km"] = haversine_km(
+            df["pickup_latitude"], df["pickup_longitude"],
+            df["dropoff_latitude"], df["dropoff_longitude"],
+        )
+    return df
+
+
+def drop_leakage(X: pd.DataFrame) -> pd.DataFrame:
+    for col in ("key", "fare_outlier", "distance_outlier", "pickup_datetime"):
+        if col in X.columns:
+            X = X.drop(columns=[col])
+    return X
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     errors = np.abs(y_true - y_pred)
-
-    # Regression metrics
-    rmse = mean_squared_error(y_true, y_pred) ** 0.5
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-    mape = mean_absolute_percentage_error(y_true, y_pred)
-
-    # Percentage of predictions within certain error thresholds
-    within_1 = (errors <= 1).sum() / len(errors) * 100
-    within_2 = (errors <= 2).sum() / len(errors) * 100
-    within_5 = (errors <= 5).sum() / len(errors) * 100
-    within_10 = (errors <= 10).sum() / len(errors) * 100
-
-    # Additional statistics
-    median_error = np.median(errors)
-    std_error = np.std(errors)
-
     return {
-        "RMSE": rmse,
-        "MAE": mae,
-        "MAPE": mape,
-        "R2_Score": r2,
-        "Median_Error": median_error,
-        "StdDev_Error": std_error,
-        "Within_$1": within_1,
-        "Within_$2": within_2,
-        "Within_$5": within_5,
-        "Within_$10": within_10,
-        "Min_Error": errors.min(),
-        "Max_Error": errors.max(),
-        "Mean_Error": errors.mean()
+        "R2":          r2_score(y_true, y_pred),
+        "RMSE":        mean_squared_error(y_true, y_pred) ** 0.5,
+        "MAE":         mean_absolute_error(y_true, y_pred),
+        "MAPE":        mean_absolute_percentage_error(y_true, y_pred) * 100,
+        "Median_AE":   float(np.median(errors)),
+        "Std_AE":      float(np.std(errors)),
+        "Within_$1":   float((errors <= 1).mean() * 100),
+        "Within_$2":   float((errors <= 2).mean() * 100),
+        "Within_$5":   float((errors <= 5).mean() * 100),
+        "Within_$10":  float((errors <= 10).mean() * 100),
+        "Max_AE":      float(errors.max()),
+        "Min_AE":      float(errors.min()),
     }
 
 
-def main():
-    model_path = Path("models/fare_model.joblib")
-    train_path = Path("data/processed/train_cleaned.parquet")
+# ---------------------------------------------------------------------------
+# Chart helpers — each returns a Figure
+# ---------------------------------------------------------------------------
+
+STYLE = {
+    "figure.facecolor": "#ffffff",
+    "axes.facecolor":   "#f8f8f8",
+    "axes.edgecolor":   "#cccccc",
+    "axes.grid":        True,
+    "grid.color":       "#e0e0e0",
+    "grid.linewidth":   0.6,
+    "font.family":      "DejaVu Sans",
+    "font.size":        10,
+    "axes.titlesize":   11,
+    "axes.titleweight": "bold",
+    "axes.labelsize":   10,
+    "xtick.labelsize":  9,
+    "ytick.labelsize":  9,
+}
+
+BLUE   = "#378ADD"
+GREEN  = "#1D9E75"
+CORAL  = "#D85A30"
+PURPLE = "#7F77DD"
+AMBER  = "#EF9F27"
+GRAY   = "#888780"
+
+
+def chart_predicted_vs_actual(y_true, y_pred, output_path: Path) -> None:
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(6, 5))
+        lim = max(y_true.max(), y_pred.max()) * 1.05
+        ax.scatter(y_true, y_pred, alpha=0.25, s=8, color=BLUE, rasterized=True, label="Predictions")
+        ax.plot([0, lim], [0, lim], color=CORAL, lw=1.5, ls="--", label="Perfect fit")
+        ax.set_xlim(0, lim)
+        ax.set_ylim(0, lim)
+        ax.set_xlabel("Actual fare ($)")
+        ax.set_ylabel("Predicted fare ($)")
+        ax.set_title("Predicted vs actual fare")
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def chart_residuals(y_true, y_pred, output_path: Path) -> None:
+    residuals = y_pred - y_true
+    with plt.rc_context(STYLE):
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+
+        # Residuals vs predicted
+        ax1.scatter(y_pred, residuals, alpha=0.2, s=6, color=PURPLE, rasterized=True)
+        ax1.axhline(0, color=CORAL, lw=1.5, ls="--")
+        ax1.set_xlabel("Predicted fare ($)")
+        ax1.set_ylabel("Residual (predicted − actual) ($)")
+        ax1.set_title("Residuals vs predicted")
+
+        # Residual distribution
+        ax2.hist(residuals, bins=80, color=BLUE, edgecolor="white", linewidth=0.3)
+        ax2.axvline(0, color=CORAL, lw=1.5, ls="--", label="Zero error")
+        ax2.axvline(residuals.mean(), color=AMBER, lw=1.5, ls="-", label=f"Mean {residuals.mean():.2f}")
+        ax2.set_xlabel("Residual ($)")
+        ax2.set_ylabel("Count")
+        ax2.set_title("Residual distribution")
+        ax2.legend(fontsize=9)
+
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def chart_error_thresholds(metrics: dict, output_path: Path) -> None:
+    thresholds = ["Within_$1", "Within_$2", "Within_$5", "Within_$10"]
+    labels     = ["±$1", "±$2", "±$5", "±$10"]
+    values     = [metrics[t] for t in thresholds]
+    colors     = [BLUE, GREEN, AMBER, CORAL]
+
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        bars = ax.bar(labels, values, color=colors, edgecolor="white", linewidth=0.5, width=0.55)
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.8,
+                    f"{val:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
+        ax.set_ylim(0, 110)
+        ax.set_xlabel("Error threshold")
+        ax.set_ylabel("% of predictions")
+        ax.set_title("Accuracy within error threshold")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def chart_feature_importance(pipeline, feature_names: list[str], output_path: Path, top_n: int = 20) -> None:
+    rf = pipeline.named_steps["model"]
+    pre = pipeline.named_steps["preprocess"]
+
+    try:
+        ohe_names = pre.named_transformers_["cat"]["onehot"].get_feature_names_out(
+            pre.transformers_[1][2]  # categorical column names
+        )
+    except Exception:
+        ohe_names = []
+
+    num_names = pre.transformers_[0][2]
+    all_names = list(num_names) + list(ohe_names)
+
+    importances = rf.feature_importances_
+    n = min(len(all_names), len(importances))
+    imp_series = pd.Series(importances[:n], index=all_names[:n]).sort_values(ascending=True).tail(top_n)
+
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(7, max(4, len(imp_series) * 0.32)))
+        colors = [BLUE if imp_series.index[i].startswith(("distance", "haversine", "pickup_lat", "pickup_lon", "dropoff"))
+                  else GREEN if imp_series.index[i].startswith("pickup_hour")
+                  else GRAY for i in range(len(imp_series))]
+        ax.barh(imp_series.index, imp_series.values, color=colors, edgecolor="white", linewidth=0.4)
+        ax.set_xlabel("Feature importance (mean decrease impurity)")
+        ax.set_title(f"Top {len(imp_series)} feature importances")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def chart_error_by_fare_bin(y_true, y_pred, output_path: Path) -> None:
+    df = pd.DataFrame({"actual": y_true, "abs_error": np.abs(y_pred - y_true)})
+    bins = [0, 5, 10, 15, 20, 30, 50, 100]
+    labels = ["$0-5", "$5-10", "$10-15", "$15-20", "$20-30", "$30-50", "$50+"]
+    df["fare_bin"] = pd.cut(df["actual"], bins=bins, labels=labels, right=False)
+    grouped = df.groupby("fare_bin", observed=True)["abs_error"].median()
+
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(grouped.index.astype(str), grouped.values, color=PURPLE,
+               edgecolor="white", linewidth=0.4, width=0.6)
+        for i, (label, val) in enumerate(zip(grouped.index, grouped.values)):
+            ax.text(i, val + 0.02, f"${val:.2f}", ha="center", va="bottom", fontsize=8)
+        ax.set_xlabel("Actual fare range")
+        ax.set_ylabel("Median absolute error ($)")
+        ax.set_title("Median error by fare range")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    BASE_DIR    = Path(__file__).resolve().parents[1]
+    model_path  = BASE_DIR / "models" / "fare_model.joblib"
+    output_dir  = BASE_DIR / "output"
+
+    # parquet may live in output/ (pandas pipeline) or data/processed/ (Spark pipeline)
+    _candidates_train = [
+        BASE_DIR / "output" / "train_cleaned.parquet",
+        BASE_DIR / "data" / "processed" / "train_cleaned.parquet",
+    ]
+    train_path = next((p for p in _candidates_train if p.exists()), _candidates_train[0])
+
+    _candidates_test = [
+        BASE_DIR / "output" / "test_cleaned.parquet",
+        BASE_DIR / "data" / "processed" / "test_cleaned.parquet",
+    ]
+    test_path = next((p for p in _candidates_test if p.exists()), _candidates_test[0])
+    output_dir.mkdir(parents=True, exist_ok=True)
     target_col = "fare_amount"
 
-    # Load model and training data
+    # ------------------------------------------------------------------
+    # 1. Load model
+    # ------------------------------------------------------------------
     if not model_path.exists():
-        raise FileNotFoundError(f"Model not found: {model_path}")
-
-    if not train_path.exists():
-        raise FileNotFoundError(f"Training data not found: {train_path}")
-
-    print("=" * 70)
-    print("MODEL ACCURACY EVALUATION")
-    print("=" * 70)
-
-    print("\n[1] Loading model and data...")
+        raise FileNotFoundError(f"Model not found: {model_path}. Run train_model.py first.")
+    print(f"Loading model from {model_path} ...")
     pipeline = joblib.load(model_path)
-    df = pd.read_parquet(train_path)
 
-    # Sample if too large
-    if len(df) > 100_000:
-        print(f"    Dataset size: {len(df):,} rows. Sampling 100k rows...")
-        df = df.sample(n=100_000, random_state=42)
+    # ------------------------------------------------------------------
+    # 2. Validation metrics (from training data split)
+    # ------------------------------------------------------------------
+    print(f"\nLoading training data from {train_path} ...")
+    if not train_path.exists():
+        raise FileNotFoundError(f"Train file not found: {train_path}")
+    df_train = pd.read_parquet(train_path)
+    if len(df_train) > 100_000:
+        df_train = df_train.sample(n=100_000, random_state=42)
 
-    print(f"    Using {len(df):,} rows")
+    y = df_train[target_col].copy()
+    X = drop_leakage(df_train.drop(columns=[target_col]))
+    X = add_features(X)
+    _, X_val, _, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found")
+    print("Running predictions on validation split ...")
+    preds_val = pipeline.predict(X_val)
+    val_metrics = compute_metrics(y_val.values, preds_val)
 
-    # Prepare data
-    y = df[target_col].copy()
-    X = df.drop(columns=[target_col]).copy()
+    # ------------------------------------------------------------------
+    # 3. Test set metrics (if test data has target column)
+    # ------------------------------------------------------------------
+    test_metrics = None
+    preds_test   = None
+    y_test_vals  = None
 
-    # Drop problematic columns
-    if "key" in X.columns:
-        X = X.drop(columns=["key"])
-    if "fare_outlier" in X.columns:
-        X = X.drop(columns=["fare_outlier"])
-    if "pickup_datetime" in X.columns:
-        X = X.drop(columns=["pickup_datetime"])
+    if test_path.exists():
+        print(f"Loading test data from {test_path} ...")
+        df_test = pd.read_parquet(test_path)
+        if len(df_test) > 50_000:
+            df_test = df_test.sample(n=50_000, random_state=42)
 
-    # Split data
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42
+        has_target = target_col in df_test.columns
+        if has_target:
+            y_test_vals = df_test[target_col].copy()
+            X_test = drop_leakage(df_test.drop(columns=[target_col]))
+        else:
+            X_test = drop_leakage(df_test.copy())
+
+        X_test = add_features(X_test)
+        preds_test = pipeline.predict(X_test)
+
+        if has_target:
+            test_metrics = compute_metrics(y_test_vals.values, preds_test)
+    else:
+        print(f"No test file found at {test_path} — skipping test evaluation.")
+
+    # ------------------------------------------------------------------
+    # 4. Print report
+    # ------------------------------------------------------------------
+    SEP = "=" * 70
+
+    print(f"\n{SEP}")
+    print("TAXI FARE PREDICTION — EVALUATION REPORT".center(70))
+    print(f"{SEP}")
+
+    def print_metrics(name: str, m: dict) -> None:
+        print(f"\n{'—'*70}")
+        print(f"  {name}")
+        print(f"{'—'*70}")
+        print(f"  R² Score  : {m['R2']:.4f}  ({m['R2']*100:.2f}% variance explained)")
+        print(f"  RMSE      : ${m['RMSE']:.4f}")
+        print(f"  MAE       : ${m['MAE']:.4f}")
+        print(f"  MAPE      : {m['MAPE']:.2f}%")
+        print(f"  Median AE : ${m['Median_AE']:.4f}   |  Std AE: ${m['Std_AE']:.4f}")
+        print(f"\n  Predictions within threshold:")
+        print(f"    ±$1  → {m['Within_$1']:.2f}%")
+        print(f"    ±$2  → {m['Within_$2']:.2f}%")
+        print(f"    ±$5  → {m['Within_$5']:.2f}%")
+        print(f"    ±$10 → {m['Within_$10']:.2f}%")
+        print(f"\n  Error range: ${m['Min_AE']:.4f} (best) → ${m['Max_AE']:.4f} (worst)")
+
+    print_metrics("VALIDATION SET", val_metrics)
+    if test_metrics:
+        print_metrics("TEST SET", test_metrics)
+
+    # Sample predictions table
+    print(f"\n{'—'*70}")
+    print("  SAMPLE PREDICTIONS — VALIDATION SET (first 20 rows)")
+    print(f"{'—'*70}")
+    sample = pd.DataFrame({
+        "Actual ($)":    y_val.iloc[:20].values,
+        "Predicted ($)": preds_val[:20],
+        "Abs Error ($)": np.abs(y_val.iloc[:20].values - preds_val[:20]),
+        "Error %":       (np.abs(y_val.iloc[:20].values - preds_val[:20]) / y_val.iloc[:20].values * 100),
+    }).round(3)
+    print(sample.to_string(index=False))
+
+    # ------------------------------------------------------------------
+    # 5. Generate charts
+    # ------------------------------------------------------------------
+    print(f"\n{SEP}")
+    print("GENERATING CHARTS".center(70))
+    print(SEP)
+
+    chart_predicted_vs_actual(
+        y_val.values, preds_val,
+        output_dir / "chart_predicted_vs_actual.png"
+    )
+    chart_residuals(
+        y_val.values, preds_val,
+        output_dir / "chart_residuals.png"
+    )
+    chart_error_thresholds(
+        val_metrics,
+        output_dir / "chart_error_thresholds.png"
+    )
+    chart_feature_importance(
+        pipeline,
+        feature_names=X_val.columns.tolist(),
+        output_path=output_dir / "chart_feature_importance.png",
+    )
+    chart_error_by_fare_bin(
+        y_val.values, preds_val,
+        output_dir / "chart_error_by_fare_bin.png"
     )
 
-    # Make predictions
-    print("\n[2] Making predictions on validation set...")
-    preds_val = pipeline.predict(X_val)
-
-    # Calculate metrics
-    print("\n[3] Calculating accuracy metrics...")
-    metrics = calculate_accuracy_metrics(y_val.values, preds_val)
-
-    # Print results
-    print("\n" + "=" * 70)
-    print("REGRESSION METRICS")
-    print("=" * 70)
-    print(f"R² Score (Coefficient of Determination): {metrics['R2_Score']:.4f}")
-    print(f"  -> Explains {metrics['R2_Score']*100:.2f}% of the variance in fares")
-    print()
-    print(f"RMSE (Root Mean Squared Error):          ${metrics['RMSE']:.4f}")
-    print(f"  -> Average prediction error magnitude")
-    print()
-    print(f"MAE (Mean Absolute Error):               ${metrics['MAE']:.4f}")
-    print(f"  -> Average absolute prediction error")
-    print()
-    print(f"MAPE (Mean Absolute Percentage Error): {metrics['MAPE']:.4f}%")
-    print(f"  -> Average percentage error relative to actual fares")
-    print()
-    print(f"Median Error:                            ${metrics['Median_Error']:.4f}")
-    print(f"Std Dev of Error:                        ${metrics['StdDev_Error']:.4f}")
-
-    print("\n" + "=" * 70)
-    print("ACCURACY AS PERCENTAGE WITHIN ERROR THRESHOLD")
-    print("=" * 70)
-    print(f"Predictions within ±$1:                  {metrics['Within_$1']:.2f}%")
-    print(f"Predictions within ±$2:                  {metrics['Within_$2']:.2f}%")
-    print(f"Predictions within ±$5:                  {metrics['Within_$5']:.2f}%")
-    print(f"Predictions within ±$10:                 {metrics['Within_$10']:.2f}%")
-
-    print("\n" + "=" * 70)
-    print("ERROR RANGE")
-    print("=" * 70)
-    print(f"Minimum Error (best prediction):         ${metrics['Min_Error']:.4f}")
-    print(f"Maximum Error (worst prediction):        ${metrics['Max_Error']:.4f}")
-    print(f"Mean Error (avg error magnitude):        ${metrics['Mean_Error']:.4f}")
-
-    # Sample predictions vs actual
-    print("\n" + "=" * 70)
-    print("SAMPLE PREDICTIONS vs ACTUAL (First 20)")
-    print("=" * 70)
-    sample_df = pd.DataFrame({
-        "Actual_Fare": y_val.iloc[:20].values,
-        "Predicted_Fare": preds_val[:20],
-        "Error": np.abs(y_val.iloc[:20].values - preds_val[:20]),
-        "Error_%": (np.abs(y_val.iloc[:20].values - preds_val[:20]) / y_val.iloc[:20].values * 100)
+    # ------------------------------------------------------------------
+    # 6. Save predictions to CSV
+    # ------------------------------------------------------------------
+    val_pred_df = pd.DataFrame({
+        "actual":    y_val.values,
+        "predicted": preds_val,
+        "abs_error": np.abs(y_val.values - preds_val),
     })
-    sample_df = sample_df.round(4)
-    print(sample_df.to_string(index=False))
+    val_pred_df.to_csv(output_dir / "val_predictions.csv", index=False)
+    print(f"  Saved: {output_dir / 'val_predictions.csv'}")
 
-    # Save evaluation report
-    print("\n[4] Saving evaluation report...")
-    report_path = Path("output/model_evaluation.txt")
+    if preds_test is not None:
+        test_pred_df = pd.DataFrame({"predicted": preds_test})
+        if y_test_vals is not None:
+            test_pred_df["actual"]    = y_test_vals.values
+            test_pred_df["abs_error"] = np.abs(y_test_vals.values - preds_test)
+        test_pred_df.to_csv(output_dir / "test_predictions.csv", index=False)
+        print(f"  Saved: {output_dir / 'test_predictions.csv'}")
+
+    # ------------------------------------------------------------------
+    # 7. Save text report
+    # ------------------------------------------------------------------
+    report_path = output_dir / "model_evaluation.txt"
     with open(report_path, "w") as f:
-        f.write("=" * 70 + "\n")
-        f.write("TAXI FARE PREDICTION MODEL - ACCURACY EVALUATION REPORT\n")
+        f.write("TAXI FARE PREDICTION — MODEL EVALUATION REPORT\n")
         f.write("=" * 70 + "\n\n")
+        for name, m in [("VALIDATION SET", val_metrics)] + (
+            [("TEST SET", test_metrics)] if test_metrics else []
+        ):
+            f.write(f"{name}\n{'-'*70}\n")
+            for k, v in m.items():
+                f.write(f"  {k:20s}: {v:.4f}\n")
+            f.write("\n")
+    print(f"  Saved: {report_path}")
 
-        f.write("REGRESSION METRICS\n")
-        f.write("-" * 70 + "\n")
-        f.write(f"R² Score:                              {metrics['R2_Score']:.4f}\n")
-        f.write(f"RMSE (Root Mean Squared Error):        ${metrics['RMSE']:.4f}\n")
-        f.write(f"MAE (Mean Absolute Error):             ${metrics['MAE']:.4f}\n")
-        f.write(f"MAPE (Mean Absolute Percentage Error): {metrics['MAPE']:.4f}%\n")
-        f.write(f"Median Error:                          ${metrics['Median_Error']:.4f}\n")
-        f.write(f"Std Dev of Error:                      ${metrics['StdDev_Error']:.4f}\n\n")
-
-        f.write("ACCURACY (% within error threshold)\n")
-        f.write("-" * 70 + "\n")
-        f.write(f"Within ±$1:                            {metrics['Within_$1']:.2f}%\n")
-        f.write(f"Within ±$2:                            {metrics['Within_$2']:.2f}%\n")
-        f.write(f"Within ±$5:                            {metrics['Within_$5']:.2f}%\n")
-        f.write(f"Within ±$10:                           {metrics['Within_$10']:.2f}%\n\n")
-
-        f.write("ERROR STATISTICS\n")
-        f.write("-" * 70 + "\n")
-        f.write(f"Minimum Error:                         ${metrics['Min_Error']:.4f}\n")
-        f.write(f"Maximum Error:                         ${metrics['Max_Error']:.4f}\n")
-        f.write(f"Mean Error:                            ${metrics['Mean_Error']:.4f}\n")
-
-    print(f"Report saved to: {report_path}")
-
-    print("\n" + "=" * 70)
-    print("INTERPRETATION")
-    print("=" * 70)
-    print(f"\n[OK] Your model achieves {metrics['R2_Score']*100:.1f}% accuracy (R² Score)")
-    print(f"[OK] Average prediction error is ${metrics['MAE']:.2f}")
-    print(f"[OK] {metrics['Within_$2']:.1f}% of predictions are within ±$2 (good for taxi fares)")
-    print("\n")
+    print(f"\n{SEP}")
+    print("  Done. All outputs written to: output/")
+    print(SEP + "\n")
 
 
 if __name__ == "__main__":
     main()
-

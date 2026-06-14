@@ -1,251 +1,199 @@
+"""clean_data.py — pandas-based data cleaning (replaces PySpark version).
+
+Reads raw train.csv / test.csv, applies the same cleaning logic as before,
+and writes parquet files to data/processed/.
+"""
+from __future__ import annotations
+
 from pathlib import Path
-from pyspark.sql import SparkSession, functions as F
-import matplotlib.pyplot as plt
 
-base_dir = Path(__file__).resolve().parents[1]
-train_path = str(base_dir / "data" / "raw" / "train.csv")
-test_path = str(base_dir / "data" / "raw" / "test.csv")
-output_dir = base_dir / "data" / "processed"
-output_dir.mkdir(parents=True, exist_ok=True)
+import numpy as np
+import pandas as pd
 
-spark = (
-    SparkSession.builder
-    .appName("taxi-data-cleaning")
-    .master("local[*]")
-    .config("spark.sql.adaptive.enabled", "false")
-    .config("spark.sql.adaptive.coalescePartitions.enabled", "false")
-    .config("spark.sql.warehouse.dir", str(base_dir / "spark-warehouse"))
-    .getOrCreate()
-)
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+BASE_DIR   = Path(__file__).resolve().parents[1]
+TRAIN_PATH = BASE_DIR / "data" / "raw" / "train.csv"
+TEST_PATH  = BASE_DIR / "data" / "raw" / "test.csv"
+OUT_DIR    = BASE_DIR / "data" / "processed"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-train_df = (
-    spark.read
-    .option("header", "true")
-    .option("inferSchema", "true")
-    .csv(train_path)
-)
 
-test_df = (
-    spark.read
-    .option("header", "true")
-    .option("inferSchema", "true")
-    .csv(test_path)
-)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-print("Train schema:")
-train_df.printSchema()
+def haversine_km(lat1: pd.Series, lon1: pd.Series,
+                 lat2: pd.Series, lon2: pd.Series) -> pd.Series:
+    R = 6371.0
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi    = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
+    return R * 2 * np.arcsin(np.sqrt(a))
 
-print("Test schema:")
-test_df.printSchema()
 
-available_cols = [
-    "key",
-    "fare_amount",
-    "pickup_datetime",
-    "pickup_longitude",
-    "pickup_latitude",
-    "dropoff_longitude",
-    "dropoff_latitude",
-    "passenger_count"
-]
+def iqr_bounds(series: pd.Series,
+               lower_k: float = 1.5,
+               upper_k: float = 1.5) -> tuple[float, float]:
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+    iqr = q3 - q1
+    return max(0.0, q1 - lower_k * iqr), q3 + upper_k * iqr
 
-train_fixed = train_df.select(*[c for c in available_cols if c in train_df.columns])
 
-numeric_cols = [
-    "fare_amount",
-    "pickup_longitude",
-    "pickup_latitude",
-    "dropoff_longitude",
-    "dropoff_latitude",
-    "passenger_count"
-]
+# ---------------------------------------------------------------------------
+# Clean train
+# ---------------------------------------------------------------------------
 
-for col_name in numeric_cols:
-    if col_name in train_fixed.columns:
-        train_fixed = train_fixed.withColumn(col_name, F.col(col_name).cast("double"))
-
-if "passenger_count" in train_fixed.columns:
-    train_fixed = train_fixed.withColumn("passenger_count", F.col("passenger_count").cast("int"))
-
-train_fixed = (
-    train_fixed
-    .withColumn("key", F.trim(F.col("key")))
-    .withColumn("pickup_datetime_raw", F.trim(F.col("pickup_datetime")))
-    .withColumn(
-        "pickup_datetime",
-        F.coalesce(
-            F.to_timestamp("pickup_datetime_raw"),
-            F.to_timestamp("pickup_datetime_raw", "yyyy-MM-dd HH:mm:ss"),
-            F.to_timestamp("pickup_datetime_raw", "yyyy-MM-dd HH:mm:ss.SSS")
-        )
+def clean_train(path: Path) -> pd.DataFrame:
+    print(f"Reading {path} ...")
+    df = pd.read_csv(
+        path,
+        usecols=["key", "fare_amount", "pickup_datetime",
+                 "pickup_longitude", "pickup_latitude",
+                 "dropoff_longitude", "dropoff_latitude",
+                 "passenger_count"],
+        parse_dates=["pickup_datetime"],
     )
-    .drop("pickup_datetime_raw")
-)
+    print(f"  Loaded {len(df):,} rows")
 
-print("Missing values before cleaning:")
-train_fixed.select([
-    F.count(F.when(F.col(c).isNull(), c)).alias(c) for c in train_fixed.columns
-]).show(truncate=False)
+    # --- cast dtypes ---
+    float_cols = ["fare_amount", "pickup_longitude", "pickup_latitude",
+                  "dropoff_longitude", "dropoff_latitude"]
+    for c in float_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["passenger_count"] = pd.to_numeric(df["passenger_count"], errors="coerce").astype("Int64")
 
-required_cols = [
-    "pickup_datetime",
-    "pickup_longitude",
-    "pickup_latitude",
-    "dropoff_longitude",
-    "dropoff_latitude",
-    "passenger_count"
-]
+    # --- drop nulls in required columns ---
+    required = ["pickup_datetime", "pickup_longitude", "pickup_latitude",
+                "dropoff_longitude", "dropoff_latitude", "passenger_count"]
+    before = len(df)
+    df = df.dropna(subset=required)
+    print(f"  Dropped {before - len(df):,} rows with nulls in required columns")
 
-train_clean = train_fixed.dropna(subset=required_cols)
+    # --- fill missing fare with median ---
+    if df["fare_amount"].isna().any():
+        median_fare = df["fare_amount"].median()
+        df["fare_amount"] = df["fare_amount"].fillna(median_fare)
 
-if "fare_amount" in train_clean.columns:
-    fare_values = train_clean.filter(F.col("fare_amount").isNotNull())
-    if fare_values.count() > 0:
-        fare_median = fare_values.approxQuantile("fare_amount", [0.5], 0.01)[0]
-        train_clean = train_clean.fillna({"fare_amount": float(fare_median)})
+    # --- deduplicate ---
+    before = len(df)
+    df = df.drop_duplicates(subset=["pickup_datetime", "pickup_longitude",
+                                    "pickup_latitude", "dropoff_longitude",
+                                    "dropoff_latitude", "passenger_count"])
+    print(f"  Removed {before - len(df):,} duplicate rows")
 
-# initial_rows = train_clean.count()
-train_clean = train_clean.dropDuplicates([
-    "pickup_datetime",
-    "pickup_longitude",
-    "pickup_latitude",
-    "dropoff_longitude",
-    "dropoff_latitude",
-    "passenger_count"
-])
-# deduped_rows = train_clean.count()
-# print(f"Duplicates removed: {initial_rows - deduped_rows:,}")
+    # --- geographic bounds (NYC area) ---
+    before = len(df)
+    df = df[
+        df["passenger_count"].between(1, 6) &
+        df["pickup_latitude"].between(40.0, 43.0) &
+        df["dropoff_latitude"].between(40.0, 43.0) &
+        df["pickup_longitude"].between(-75.0, -72.0) &
+        df["dropoff_longitude"].between(-75.0, -72.0)
+    ]
+    print(f"  Removed {before - len(df):,} rows outside geographic bounds")
 
-train_clean = (
-    train_clean
-    .filter(F.col("passenger_count").between(1, 6))
-    .filter(F.col("pickup_latitude").between(40.0, 43.0))
-    .filter(F.col("dropoff_latitude").between(40.0, 43.0))
-    .filter(F.col("pickup_longitude").between(-75.0, -72.0))
-    .filter(F.col("dropoff_longitude").between(-75.0, -72.0))
-)
+    # --- positive fare ---
+    before = len(df)
+    df = df[df["fare_amount"] > 0]
+    print(f"  Removed {before - len(df):,} rows with non-positive fare")
 
-train_clean = train_clean.withColumn(
-    "distance_km",
-    111 * F.sqrt(
-        F.pow(F.col("pickup_longitude") - F.col("dropoff_longitude"), 2) +
-        F.pow(F.col("pickup_latitude") - F.col("dropoff_latitude"), 2)
-    )
-)
-
-if "fare_amount" in train_clean.columns:
-    train_clean = train_clean.filter(F.col("fare_amount") > 0)
-
-distance_q1, distance_q3 = train_clean.approxQuantile("distance_km", [0.25, 0.75], 0.01)
-distance_iqr = distance_q3 - distance_q1
-distance_lower = max(0, distance_q1 - 1.5 * distance_iqr)
-distance_upper = distance_q3 + 2 * distance_iqr
-
-train_clean = train_clean.withColumn(
-    "distance_outlier",
-    ~F.col("distance_km").between(distance_lower, distance_upper)
-)
-
-if "fare_amount" in train_clean.columns:
-    fare_q1, fare_q3 = train_clean.approxQuantile("fare_amount", [0.25, 0.75], 0.01)
-    fare_iqr = fare_q3 - fare_q1
-    fare_lower = max(0, fare_q1 - 1.5 * fare_iqr)
-    fare_upper = fare_q3 + 1.5 * fare_iqr
-
-    train_clean = train_clean.withColumn(
-        "fare_outlier",
-        ~F.col("fare_amount").between(fare_lower, fare_upper)
+    # --- distance feature (Euclidean, matches original Spark script) ---
+    df["distance_km"] = 111 * np.sqrt(
+        (df["pickup_longitude"] - df["dropoff_longitude"]) ** 2 +
+        (df["pickup_latitude"]  - df["dropoff_latitude"])  ** 2
     )
 
-    clean_final = train_clean.filter(~F.col("distance_outlier") & ~F.col("fare_outlier"))
-else:
-    clean_final = train_clean.filter(~F.col("distance_outlier"))
+    # --- distance outliers (IQR, upper_k=2 as in original) ---
+    dist_lo, dist_hi = iqr_bounds(df["distance_km"], lower_k=1.5, upper_k=2.0)
+    df["distance_outlier"] = ~df["distance_km"].between(dist_lo, dist_hi)
+    print(f"  Distance bounds: {dist_lo:.2f} km – {dist_hi:.2f} km")
+    print(f"  Distance outliers: {df['distance_outlier'].sum():,}")
 
-clean_final = (
-    clean_final
-    .withColumn("passenger_count", F.col("passenger_count").cast("int"))
-    .withColumn("pickup_year", F.year("pickup_datetime"))
-    .withColumn("pickup_month", F.month("pickup_datetime"))
-    .withColumn("pickup_day", F.dayofmonth("pickup_datetime"))
-    .withColumn("pickup_hour", F.hour("pickup_datetime"))
-)
+    # --- fare outliers (IQR 1.5 both sides) ---
+    fare_lo, fare_hi = iqr_bounds(df["fare_amount"])
+    df["fare_outlier"] = ~df["fare_amount"].between(fare_lo, fare_hi)
+    print(f"  Fare outliers: {df['fare_outlier'].sum():,}")
 
-# print("Schema after cleaning:")
-# clean_final.printSchema()
-#
-# print("Missing values after cleaning:")
-# clean_final.select([
-#     F.count(F.when(F.col(c).isNull(), c)).alias(c) for c in clean_final.columns
-# ]).show(truncate=False)
+    # --- keep only clean rows ---
+    before = len(df)
+    df = df[~df["distance_outlier"] & ~df["fare_outlier"]]
+    print(f"  Removed {before - len(df):,} outlier rows → {len(df):,} clean rows remain")
 
-normal_data = train_clean.filter(~F.col("distance_outlier"))
-outlier_data = train_clean.filter(F.col("distance_outlier"))
+    # --- datetime parts ---
+    df["pickup_year"]  = df["pickup_datetime"].dt.year
+    df["pickup_month"] = df["pickup_datetime"].dt.month
+    df["pickup_day"]   = df["pickup_datetime"].dt.day
+    df["pickup_hour"]  = df["pickup_datetime"].dt.hour
 
-print(f"Normal rows: {normal_data.count():,}")
-print(f"Outlier rows: {outlier_data.count():,}")
-print(f"Distance bounds: {distance_lower:.2f} km - {distance_upper:.2f} km")
+    df["passenger_count"] = df["passenger_count"].astype(int)
 
-normal_pd = normal_data.sample(False, 0.05, seed=42).select("distance_km").toPandas()
-outlier_pd = outlier_data.sample(False, 0.40, seed=42).select("distance_km").toPandas()
+    return df
 
-# fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6))
-#
-# ax1.hist(
-#     normal_pd["distance_km"],
-#     bins=50,
-#     color="blue",
-#     alpha=0.7,
-#     density=True,
-#     edgecolor="darkblue",
-#     linewidth=1,
-#     label="Normal distribution"
-# )
-# ax1.axvline(distance_lower, color="green", ls="--", lw=2, label=f"Lower: {distance_lower:.1f}")
-# ax1.axvline(distance_upper, color="green", ls="--", lw=2, label=f"Upper: {distance_upper:.1f}")
-# ax1.set_xlabel("Distance (km)")
-# ax1.set_ylabel("Density")
-# ax1.set_title("Normal Trips Distribution")
-# ax1.legend()
-# ax1.grid(True, alpha=0.3)
-#
-# ax2.scatter(
-#     normal_pd.index,
-#     normal_pd["distance_km"],
-#     color="lightblue",
-#     alpha=0.5,
-#     s=20,
-#     label=f"Normal ({len(normal_pd):,})"
-# )
-# ax2.scatter(
-#     outlier_pd.index,
-#     outlier_pd["distance_km"],
-#     color="red",
-#     alpha=0.9,
-#     s=60,
-#     edgecolors="darkred",
-#     linewidth=1.5,
-#     label=f"Outliers ({len(outlier_pd):,})",
-#     zorder=10
-# )
-# ax2.axhline(distance_lower, color="green", ls="--", lw=2, alpha=0.8)
-# ax2.axhline(distance_upper, color="green", ls="--", lw=2, alpha=0.8)
-# ax2.set_xlabel("Index")
-# ax2.set_ylabel("Distance (km)")
-# ax2.set_title("Distance Outliers")
-# ax2.legend()
-# ax2.grid(True, alpha=0.3)
-#
-# plt.tight_layout()
-# chart_path = output_dir / "distance_outliers.png"
-# plt.savefig(chart_path, dpi=200, bbox_inches="tight")
-# plt.close()
 
-parquet_path = str(output_dir / "train_cleaned.parquet")
+# ---------------------------------------------------------------------------
+# Clean test (no fare column, lighter cleaning)
+# ---------------------------------------------------------------------------
 
-clean_final = clean_final.coalesce(2)
-clean_final.write.mode("overwrite").option("compression", "snappy").parquet(parquet_path)
+def clean_test(path: Path) -> pd.DataFrame:
+    print(f"\nReading {path} ...")
+    df = pd.read_csv(
+        path,
+        parse_dates=["pickup_datetime"],
+    )
+    print(f"  Loaded {len(df):,} rows")
 
-# print(f"Chart saved to: {chart_path}")
-print(f"Cleaned parquet saved to: {parquet_path}")
+    float_cols = ["pickup_longitude", "pickup_latitude",
+                  "dropoff_longitude", "dropoff_latitude"]
+    for c in float_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "passenger_count" in df.columns:
+        df["passenger_count"] = pd.to_numeric(df["passenger_count"], errors="coerce").fillna(1).astype(int)
 
-spark.stop()
+    # distance
+    df["distance_km"] = 111 * np.sqrt(
+        (df["pickup_longitude"] - df["dropoff_longitude"]) ** 2 +
+        (df["pickup_latitude"]  - df["dropoff_latitude"])  ** 2
+    )
+
+    # datetime parts
+    df["pickup_year"]  = df["pickup_datetime"].dt.year
+    df["pickup_month"] = df["pickup_datetime"].dt.month
+    df["pickup_day"]   = df["pickup_datetime"].dt.day
+    df["pickup_hour"]  = df["pickup_datetime"].dt.hour
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    # Train
+    if not TRAIN_PATH.exists():
+        raise FileNotFoundError(f"Raw train CSV not found: {TRAIN_PATH}")
+
+    train_clean = clean_train(TRAIN_PATH)
+    out_train = OUT_DIR / "train_cleaned.parquet"
+    train_clean.to_parquet(out_train, index=False, compression="snappy")
+    print(f"\nSaved cleaned train to: {out_train}  ({len(train_clean):,} rows)")
+
+    # Test (optional)
+    if TEST_PATH.exists():
+        test_clean = clean_test(TEST_PATH)
+        out_test = OUT_DIR / "test_cleaned.parquet"
+        test_clean.to_parquet(out_test, index=False, compression="snappy")
+        print(f"Saved cleaned test  to: {out_test}  ({len(test_clean):,} rows)")
+    else:
+        print(f"\nNo test CSV found at {TEST_PATH} — skipping.")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
